@@ -43,7 +43,7 @@ import pandas as pd
 # Configuration (matching SMCHN paper exactly)
 # ─────────────────────────────────────────────────────────────────────────────
 
-RAW_DIR    = "data/raw/2021_12"
+RAW_DIR    = "data/2021_12"
 OUT_BASE   = "dataset/noaa_dec2021_1min"
 
 # SMCHN paper geographic bounds
