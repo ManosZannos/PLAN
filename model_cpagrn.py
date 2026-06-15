@@ -213,7 +213,7 @@ class CPAGRN(nn.Module):
 
         # 2. GRU — each vessel independently
         x_in = x.reshape(B * N, T, self.d_model)
-        _, h_n = self.gru(x_in),           # trick to unpack
+        _, h_n = self.gru(x_in)           # trick to unpack
         # proper call:
         _, h_n = self.gru(x_in)                # h_n: [layers, B*N, d_model]
         h = h_n[-1].reshape(B, N, self.d_model)  # [B, N, d_model]
