@@ -119,7 +119,7 @@ def clean_raw(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     # Replace invalid heading
-    df["Heading"] = df["Heading"].replace(511.0, np.nan)
+    df = df[(df["Heading"] >= HDG_MIN) & (df["Heading"] <= HDG_MAX)]
 
     return df.sort_values(["MMSI", "BaseDateTime"]).reset_index(drop=True)
 
@@ -158,8 +158,8 @@ def resample_vessel(vd: pd.DataFrame) -> pd.DataFrame:
 
         # SOG/Heading: use average (SMCHN paper) = forward fill then interpolate
         resampled["SOG"]     = resampled["SOG"].ffill(limit=INTERP_LIMIT)
-        resampled["Heading"] = resampled["Heading"].ffill(limit=INTERP_LIMIT)
-        resampled["Heading"] = resampled["Heading"].bfill(limit=INTERP_LIMIT)
+        resampled["Heading"] = resampled["Heading"].interpolate(
+            method="linear", limit=INTERP_LIMIT).ffill(limit=INTERP_LIMIT).bfill(limit=INTERP_LIMIT)
 
         resampled = resampled.dropna(subset=["LAT", "LON", "SOG"])
         if len(resampled) >= 2:
