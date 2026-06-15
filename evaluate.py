@@ -57,8 +57,13 @@ def load_model(args, device):
             pred_len     = saved.get('pred_len',     args.pred_len),
         ).to(device)
     else:
-        # CPA-GRN will be added in next step
-        raise NotImplementedError('CPA-GRN evaluation not yet implemented')
+        from model_cpagrn import CPAGRN
+    model = CPAGRN(
+        feature_size = 4,
+        d_model      = saved.get('d_model', 64),
+        gru_layers   = saved.get('gru_layers', 1),
+        pred_len     = saved.get('pred_len', args.pred_len),
+    ).to(device)
 
     model.load_state_dict(ckpt['model'])
     model.eval()
@@ -98,7 +103,7 @@ def evaluate(args, model, loader, stats, device):
             if args.model == 'lstm':
                 pred_disp = model(obs, mask=mask)     # [B, N, pred_len, 2]
             else:
-                raise NotImplementedError
+                pred_disp = model(obs, mask=mask)
 
             # Absolute predicted positions (z-score)
             pred_abs   = pred_disp   + last_obs.unsqueeze(2)  # [B, N, T, 2]
