@@ -172,21 +172,30 @@ def collate_fn(batch):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_dataloaders(
-    data_dir:    str = 'dataset/noaa_dec2021_1min',
-    obs_len:     int = 5,
-    pred_len:    int = 5,
-    batch_size:  int = 32,
-    stride:      int = 1,
-    num_workers: int = 0,
+    data_dir:     str = 'dataset/noaa_dec2021_1min',
+    obs_len:      int = 5,
+    pred_len:     int = 5,
+    batch_size:   int = 32,
+    train_stride: int = 1,
+    eval_stride:  int = None,
+    num_workers:  int = 0,
 ):
+    """
+    train_stride=1  : maximum overlap for training (more samples)
+    eval_stride=None: defaults to obs_len+pred_len (fully non-overlapping)
+                      gives independent test samples for honest evaluation
+    """
+    if eval_stride is None:
+        eval_stride = obs_len + pred_len
+
     stats_path = os.path.join(data_dir, 'global_stats.json')
     with open(stats_path) as f:
         stats = json.load(f)
 
     print('Building datasets...')
-    train_ds = AISDataset(os.path.join(data_dir, 'train'), obs_len, pred_len, stride=stride)
-    val_ds   = AISDataset(os.path.join(data_dir, 'val'),   obs_len, pred_len, stride=stride)
-    test_ds  = AISDataset(os.path.join(data_dir, 'test'),  obs_len, pred_len, stride=stride)
+    train_ds = AISDataset(os.path.join(data_dir, 'train'), obs_len, pred_len, stride=train_stride)
+    val_ds   = AISDataset(os.path.join(data_dir, 'val'),   obs_len, pred_len, stride=eval_stride)
+    test_ds  = AISDataset(os.path.join(data_dir, 'test'),  obs_len, pred_len, stride=eval_stride)
 
     print(f'\nSample counts:')
     print(f'  Train: {len(train_ds):,}')
