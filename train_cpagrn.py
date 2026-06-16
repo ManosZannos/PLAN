@@ -22,6 +22,8 @@ import logging
 import torch
 import torch.nn as nn
 
+import numpy as np
+
 from dataset import get_dataloaders
 from model_cpagrn import CPAGRN, cpagrn_loss
 
@@ -81,7 +83,12 @@ def run_epoch(loader, model, optimizer, device, args, train: bool):
 
 
 def main():
+
     args = get_args()
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    np.random.seed(42)
+
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_num)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
