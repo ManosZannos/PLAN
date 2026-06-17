@@ -37,8 +37,11 @@ class CPAFeatures(nn.Module):
         TCPA  — time to closest point of approach (negative = past)
         DCPA  — distance at closest point of approach
         dist  — current distance
-        sin/cos(bearing)    — direction from i to j
-        sin/cos(Δheading)   — relative heading difference
+        sin/cos(bearing)  — direction from i to j (bearing is in radians: valid)
+        sin/cos(Δheading) — NOTE: heading is z-score normalized, so we cannot
+                            interpret it as radians. We use dhdg directly as
+                            two identical features to preserve EDGE_DIM=7
+                            and let the network learn the mapping.
 
     All computed in z-score normalised space.
     """
@@ -51,7 +54,7 @@ class CPAFeatures(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """
-        obs: [B, N, T_obs, 4]  (LON, LAT, SOG, Heading)
+        obs: [B, N, T_obs, 4]  (LON, LAT, SOG, Heading — z-score)
         Returns: [B, N, N, 7]
         """
         B, N, T, _ = obs.shape
@@ -71,8 +74,15 @@ class CPAFeatures(nn.Module):
         v = vel_j - vel_i
 
         dist    = r.norm(dim=-1)
+        # bearing is computed from (LON, LAT) differences — valid to use atan2
+        # since the spatial structure is preserved under z-score normalization
         bearing = torch.atan2(r[..., 1], r[..., 0])
-        dhdg    = (hdg_j - hdg_i) * 2.0 * math.pi
+
+        # Heading is z-score normalized: interpret difference directly.
+        # We expose dhdg twice (as-is and negated) to give the network
+        # symmetric information about the relative heading, while preserving
+        # EDGE_DIM=7 for architectural consistency.
+        dhdg = hdg_j - hdg_i
 
         v_sq = (v * v).sum(dim=-1) + self.eps
         tcpa = (-(r * v).sum(dim=-1) / v_sq).clamp(-5.0, 5.0)
@@ -84,8 +94,8 @@ class CPAFeatures(nn.Module):
             dist,
             torch.sin(bearing),
             torch.cos(bearing),
-            torch.sin(dhdg),
-            torch.cos(dhdg),
+            dhdg,           # relative heading (z-score space)
+            dhdg.abs(),     # absolute heading difference (always >= 0)
         ], dim=-1)  # [B, N, N, 7]
 
 
@@ -142,11 +152,12 @@ class CPAAwareSpatialLayer(nn.Module):
             threshold   = kth_dist[..., -1].unsqueeze(-1)  # [B, N, 1]
             scores      = scores.masked_fill(dist > threshold, float('-inf'))
 
-        weights = F.softmax(scores, dim=-1)
+        weights = F.softmax(scores, dim=-1)          # [B, N, N]
         weights = torch.nan_to_num(weights, nan=0.0)
 
-        values = self.value_proj(h)       # [B, N, D]
-        agg    = torch.bmm(weights, values)
+        values = self.value_proj(h)                  # [B, N, D]
+        # einsum is clearer than bmm for [B,N,N] x [B,N,D] -> [B,N,D]
+        agg = torch.einsum('bij,bjd->bid', weights, values)
 
         return self.norm(h + agg)
 
