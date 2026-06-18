@@ -1,14 +1,11 @@
 """
-train_cpagrn.py — Training script for CPA-GRN.
+train_cpagrn.py — Training script for CPA-GRN (v3: distance threshold).
 
-Identical setup to train_lstm.py for fair comparison:
-  - Same dataset, same obs/pred lengths
-  - Same MSE loss
-  - Same LR schedule
-  - Same batch size and epochs
+Identical setup to train_lstm.py for fair comparison.
+Passes global_stats to model.forward() for distance denormalization.
 
 Usage:
-    python train_cpagrn.py --obs_len 5 --pred_len 5 --tag CPAGRN_obs5_pred5
+    python train_cpagrn.py --obs_len 5 --pred_len 5 --tag CPAGRN_obs5_pred5_s42
 """
 
 from __future__ import annotations
@@ -21,7 +18,6 @@ import logging
 
 import torch
 import torch.nn as nn
-
 import numpy as np
 
 from dataset import get_dataloaders
@@ -30,18 +26,20 @@ from model_cpagrn import CPAGRN, cpagrn_loss
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--data_dir',    type=str,   default='dataset/noaa_dec2021_1min')
-    p.add_argument('--obs_len',     type=int,   default=5)
-    p.add_argument('--pred_len',    type=int,   default=5)
-    p.add_argument('--d_model',     type=int,   default=64)
-    p.add_argument('--gru_layers',  type=int,   default=1)
-    p.add_argument('--epochs',      type=int,   default=200)
-    p.add_argument('--batch_size',  type=int,   default=32)
-    p.add_argument('--lr',          type=float, default=1e-3)
-    p.add_argument('--clip_grad',   type=float, default=1.0)
-    p.add_argument('--gpu_num',     type=int,   default=0)
-    p.add_argument('--tag',         type=str,   default='CPAGRN_obs5_pred5')
-    p.add_argument('--log_every',   type=int,   default=10)
+    p.add_argument('--data_dir',       type=str,   default='dataset/noaa_dec2021_1min')
+    p.add_argument('--obs_len',        type=int,   default=5)
+    p.add_argument('--pred_len',       type=int,   default=5)
+    p.add_argument('--d_model',        type=int,   default=64)
+    p.add_argument('--gru_layers',     type=int,   default=1)
+    p.add_argument('--epochs',         type=int,   default=200)
+    p.add_argument('--batch_size',     type=int,   default=32)
+    p.add_argument('--lr',             type=float, default=1e-3)
+    p.add_argument('--clip_grad',      type=float, default=1.0)
+    p.add_argument('--gpu_num',        type=int,   default=0)
+    p.add_argument('--tag',            type=str,   default='CPAGRN_obs5_pred5')
+    p.add_argument('--log_every',      type=int,   default=10)
+    p.add_argument('--dist_threshold', type=float, default=0.05,
+                   help='Distance threshold in degrees (~3nm) for spatial attention')
     return p.parse_args()
 
 
@@ -53,20 +51,20 @@ def get_lr(epoch, args):
     return args.lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
-def run_epoch(loader, model, optimizer, device, args, train: bool):
+def run_epoch(loader, model, optimizer, device, args, stats, train: bool):
     model.train(train)
     total_loss = 0.0
     n_batches  = 0
 
     for obs, pred_gt, mask, _ in loader:
-        obs     = obs.to(device)      # [B, N, obs_len, 4]
-        pred_gt = pred_gt.to(device)  # [B, N, pred_len, 2]
-        mask    = mask.to(device)     # [B, N] bool
+        obs     = obs.to(device)
+        pred_gt = pred_gt.to(device)
+        mask    = mask.to(device)
 
         last_obs    = obs[:, :, -1, :2]
         target_disp = pred_gt - last_obs.unsqueeze(2)
 
-        pred_disp = model(obs, mask=mask)
+        pred_disp = model(obs, mask=mask, stats=stats)
 
         loss = cpagrn_loss(pred_disp, target_disp, mask)
 
@@ -83,12 +81,10 @@ def run_epoch(loader, model, optimizer, device, args, train: bool):
 
 
 def main():
-
     args = get_args()
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     np.random.seed(42)
-
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_num)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -118,10 +114,11 @@ def main():
     log.info(f'Train batches: {len(train_loader)} | Val batches: {len(val_loader)}')
 
     model = CPAGRN(
-        feature_size = 4,
-        d_model      = args.d_model,
-        gru_layers   = args.gru_layers,
-        pred_len     = args.pred_len,
+        feature_size   = 4,
+        d_model        = args.d_model,
+        gru_layers     = args.gru_layers,
+        pred_len       = args.pred_len,
+        dist_threshold = args.dist_threshold,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -138,8 +135,8 @@ def main():
             pg['lr'] = lr
 
         t0 = time.time()
-        train_loss = run_epoch(train_loader, model, optimizer, device, args, train=True)
-        val_loss   = run_epoch(val_loader,   model, optimizer, device, args, train=False)
+        train_loss = run_epoch(train_loader, model, optimizer, device, args, stats, train=True)
+        val_loss   = run_epoch(val_loader,   model, optimizer, device, args, stats, train=False)
         elapsed    = time.time() - t0
 
         if (epoch + 1) % args.log_every == 0 or epoch == 0:

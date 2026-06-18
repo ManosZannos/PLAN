@@ -1,12 +1,12 @@
 """
-evaluate_cpagrn.py — Evaluation for CPA-GRN (novel model).
+evaluate_cpagrn.py — Evaluation for CPA-GRN (v3: distance threshold).
 
 Reports ADE/FDE in degrees per prediction horizon,
 matching SMCHN Table 2 format for direct comparison.
 
 Usage:
-    python evaluate_cpagrn.py --tag CPAGRN_obs5_pred5 --split test
-    python evaluate_cpagrn.py --tag CPAGRN_obs10_pred10 --split test
+    python evaluate_cpagrn.py --tag CPAGRN_obs5_pred5_s42 --split test
+    python evaluate_cpagrn.py --tag CPAGRN_obs10_pred10_s42 --split test
 """
 
 from __future__ import annotations
@@ -21,14 +21,14 @@ from model_cpagrn import CPAGRN
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--tag',        type=str, default='CPAGRN_obs5_pred5')
-    p.add_argument('--split',      type=str, default='test',
+    p.add_argument('--tag',            type=str,   default='CPAGRN_obs5_pred5_s42')
+    p.add_argument('--split',          type=str,   default='test',
                    choices=['val', 'test'])
-    p.add_argument('--data_dir',   type=str, default='dataset/noaa_dec2021_1min')
-    p.add_argument('--obs_len',    type=int, default=5)
-    p.add_argument('--pred_len',   type=int, default=5)
-    p.add_argument('--batch_size', type=int, default=32)
-    p.add_argument('--gpu_num',    type=int, default=0)
+    p.add_argument('--data_dir',       type=str,   default='dataset/noaa_dec2021_1min')
+    p.add_argument('--obs_len',        type=int,   default=5)
+    p.add_argument('--pred_len',       type=int,   default=5)
+    p.add_argument('--batch_size',     type=int,   default=32)
+    p.add_argument('--gpu_num',        type=int,   default=0)
     return p.parse_args()
 
 
@@ -49,12 +49,15 @@ def main():
     stats = ckpt.get('stats', None)
     print(f'Loaded epoch {ckpt["epoch"]}  val_loss={ckpt.get("val_loss","?"):.6f}')
 
-    # Model
+    # Model — load dist_threshold from checkpoint if available
+    dist_threshold = saved.get('dist_threshold', 0.05)
+
     model = CPAGRN(
-        feature_size = 4,
-        d_model      = saved.get('d_model',    64),
-        gru_layers   = saved.get('gru_layers', 1),
-        pred_len     = saved.get('pred_len',   args.pred_len),
+        feature_size   = 4,
+        d_model        = saved.get('d_model',    64),
+        gru_layers     = saved.get('gru_layers', 1),
+        pred_len       = saved.get('pred_len',   args.pred_len),
+        dist_threshold = dist_threshold,
     ).to(device)
     model.load_state_dict(ckpt['model'])
     model.eval()
@@ -82,7 +85,7 @@ def main():
 
             last_obs    = obs[:, :, -1, :2]
             target_disp = pred_gt - last_obs.unsqueeze(2)
-            pred_disp   = model(obs, mask=mask)
+            pred_disp   = model(obs, mask=mask, stats=stats)
 
             pred_abs   = (pred_disp   + last_obs.unsqueeze(2)).cpu().numpy()
             target_abs = (target_disp + last_obs.unsqueeze(2)).cpu().numpy()

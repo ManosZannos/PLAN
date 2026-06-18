@@ -1,24 +1,25 @@
 """
-model_cpagrn.py — CPA-Aware Graph Recurrent Network (v2: Autoregressive Decoder)
+model_cpagrn.py — CPA-Aware Graph Recurrent Network (v3: Distance Threshold)
 
 Novel contribution: TCPA/DCPA as differentiable edge features in spatial
-attention — the first model to use collision risk metrics as learnable
-input features for vessel trajectory prediction.
+attention, with physics-informed distance masking.
 
-Architecture:
+Key change from v1/v2: instead of top_k nearest neighbors, we use a
+distance threshold of 0.05° (~3 nautical miles) to select neighbors.
+This is physically motivated: at typical vessel speeds (10-15 knots),
+only vessels within 3nm can realistically influence a vessel's trajectory
+within the 5-10 minute prediction horizon (COLREGS action range).
+
+With N≈207 vessels per window and a 5°×5° area, most vessels are >20nm
+apart. The threshold ensures each vessel attends only to the 1-5 truly
+relevant neighbors, eliminating noise from distant vessels.
+
+Architecture (same as v1, only neighbor selection changes):
   1. Feature Embedding    Linear(4 → d_model) + LayerNorm
   2. GRU Encoder          per-vessel recurrence over obs_len steps
-  3. Autoregressive Decoder: for each prediction step t:
-       a. Compute CPA edge features from current predicted positions
-       b. CPA-Aware Spatial attention (sparse, top_k nearest)
-       c. GRU Decoder step: update hidden state
-       d. MLP step: predict displacement Δpos_t
-
-Key improvement over v1: spatial attention is re-applied at every prediction
-step using updated positions, so CPA features evolve with the trajectory.
-This allows the model to capture how collision risk changes over time.
-
-Uses deterministic MSE loss (same as Vanilla LSTM) for clean comparison.
+  3. CPA-Aware Spatial    message passing with TCPA/DCPA edge features
+                          physics-informed: only neighbors within 0.05°
+  4. Decoder              MLP → pred_len displacements
 
 Input:  obs  [B, N, obs_len, 4]    (LON, LAT, SOG, Heading — z-score)
 Output: pred [B, N, pred_len, 2]   (displacement in z-score space)
@@ -35,17 +36,15 @@ import torch.nn.functional as F
 
 class CPAFeatures(nn.Module):
     """
-    Computes 7 pairwise edge features from current positions and velocities.
+    Computes 7 pairwise edge features from the last observed positions.
 
     For each vessel pair (i → j):
-        TCPA  — time to closest point of approach (clamped, normalized)
-        DCPA  — distance at closest point of approach (clamped)
-        dist  — current Euclidean distance
-        sin/cos(bearing)  — direction from i to j (valid: from position diff)
-        dhdg              — relative heading difference (z-score space)
-        dhdg.abs()        — absolute heading difference (always >= 0)
-
-    All computed in z-score normalised space.
+        TCPA  — time to closest point of approach
+        DCPA  — distance at closest point of approach
+        dist  — current Euclidean distance (z-score space)
+        sin/cos(bearing) — direction from i to j
+        dhdg             — relative heading (z-score space)
+        dhdg.abs()       — absolute heading difference
     """
 
     EDGE_DIM = 7
@@ -54,14 +53,16 @@ class CPAFeatures(nn.Module):
         super().__init__()
         self.eps = eps
 
-    def forward(
-        self,
-        pos: torch.Tensor,   # [B, N, 2]  current (LON, LAT) — z-score
-        vel: torch.Tensor,   # [B, N, 2]  current velocity    — z-score
-        hdg: torch.Tensor,   # [B, N]     current heading     — z-score
-    ) -> torch.Tensor:
-        """Returns [B, N, N, 7]"""
-        B, N, _ = pos.shape
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        obs: [B, N, T_obs, 4]
+        Returns: [B, N, N, 7]
+        """
+        B, N, T, _ = obs.shape
+
+        pos = obs[:, :, -1, :2]
+        vel = pos - obs[:, :, -2, :2] if T >= 2 else torch.zeros_like(pos)
+        hdg = obs[:, :, -1, 3]
 
         pos_i = pos.unsqueeze(2).expand(B, N, N, 2)
         pos_j = pos.unsqueeze(1).expand(B, N, N, 2)
@@ -70,12 +71,12 @@ class CPAFeatures(nn.Module):
         hdg_i = hdg.unsqueeze(2).expand(B, N, N)
         hdg_j = hdg.unsqueeze(1).expand(B, N, N)
 
-        r = pos_j - pos_i          # relative position vector
-        v = vel_j - vel_i          # relative velocity vector
+        r = pos_j - pos_i
+        v = vel_j - vel_i
 
         dist    = r.norm(dim=-1)
         bearing = torch.atan2(r[..., 1], r[..., 0])
-        dhdg    = hdg_j - hdg_i    # relative heading (z-score space)
+        dhdg    = hdg_j - hdg_i
 
         v_sq = (v * v).sum(dim=-1) + self.eps
         tcpa = (-(r * v).sum(dim=-1) / v_sq).clamp(-5.0, 5.0)
@@ -93,20 +94,30 @@ class CPAFeatures(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. CPA-Aware Spatial Attention Layer (sparse)
+# 2. CPA-Aware Spatial Attention Layer (distance threshold)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CPAAwareSpatialLayer(nn.Module):
     """
-    CPA-aware message passing with sparse attention.
+    CPA-aware message passing with physics-informed distance masking.
 
-    Each vessel attends only to its top_k nearest neighbors
-    (by current distance), reducing noise from far-away vessels.
+    Only vessels within dist_threshold degrees attend to each other.
+    At 0.05° (~3nm), this corresponds to the COLREGS action range for
+    vessels moving at typical speeds within a 5-10 minute horizon.
+
+    If a vessel has NO neighbors within the threshold (isolated vessel),
+    it falls back to self-attention only (identity: h unchanged).
     """
 
-    def __init__(self, d_model: int, edge_dim: int = 7, top_k: int = 20):
+    def __init__(
+        self,
+        d_model:        int   = 64,
+        edge_dim:       int   = 7,
+        dist_threshold: float = 0.05,   # degrees — ~3 nautical miles
+    ):
         super().__init__()
-        self.top_k = top_k
+        self.dist_threshold = dist_threshold
+
         self.attn_mlp = nn.Sequential(
             nn.Linear(2 * d_model + edge_dim, d_model),
             nn.ReLU(),
@@ -120,6 +131,7 @@ class CPAAwareSpatialLayer(nn.Module):
         h:     torch.Tensor,         # [B, N, d_model]
         edges: torch.Tensor,         # [B, N, N, 7]
         mask:  torch.Tensor | None,  # [B, N] bool
+        stats: dict | None = None,   # global_stats for denormalization
     ) -> torch.Tensor:
         B, N, D = h.shape
 
@@ -135,167 +147,126 @@ class CPAAwareSpatialLayer(nn.Module):
             mask_j = mask.unsqueeze(1).expand(B, N, N)
             scores = scores.masked_fill(~mask_j, float('-inf'))
 
-        # Sparse: keep only top_k nearest neighbors per vessel
-        if self.top_k < N:
-            dist = edges[..., 2]  # [B, N, N]
-            if mask is not None:
-                dist = dist.masked_fill(~mask_j, float('inf'))
-            k = min(self.top_k, N)
-            kth_dist, _ = dist.topk(k, dim=-1, largest=False)
-            threshold   = kth_dist[..., -1].unsqueeze(-1)
-            scores      = scores.masked_fill(dist > threshold, float('-inf'))
+        # Physics-informed distance masking
+        # edges[..., 2] is dist in z-score space — convert to degrees
+        dist_norm = edges[..., 2]  # [B, N, N] — normalized distance
 
-        weights = F.softmax(scores, dim=-1)           # [B, N, N]
-        weights = torch.nan_to_num(weights, nan=0.0)
+        if stats is not None:
+            # Denormalize: dist_degrees = dist_norm * std_LON + mean_LON
+            # Use LON std as proxy for spatial scale (LAT and LON stds are similar)
+            lon_std  = stats['LON']['std']
+            lat_std  = stats['LAT']['std']
+            # Euclidean distance in degrees: sqrt((dLON*lon_std)^2 + (dLAT*lat_std)^2)
+            # We approximate with dist_norm * mean(lon_std, lat_std)
+            spatial_std = (lon_std + lat_std) / 2.0
+            dist_degrees = dist_norm * spatial_std
+        else:
+            # Fallback: treat normalized dist directly (less accurate)
+            dist_degrees = dist_norm
 
-        values = self.value_proj(h)                   # [B, N, D]
-        agg    = torch.einsum('bij,bjd->bid', weights, values)
+        # Mask vessels beyond threshold
+        too_far = dist_degrees > self.dist_threshold
+        if mask is not None:
+            too_far = too_far | ~mask_j
+        scores = scores.masked_fill(too_far, float('-inf'))
 
-        return self.norm(h + agg)                     # [B, N, D]
+        weights = F.softmax(scores, dim=-1)  # [B, N, N]
+
+        # Handle isolated vessels (all neighbors masked → NaN after softmax)
+        # Fall back to uniform self-attention (no message passing)
+        isolated = weights.isnan().all(dim=-1, keepdim=True)  # [B, N, 1]
+        weights   = torch.nan_to_num(weights, nan=0.0)
+
+        values = self.value_proj(h)                            # [B, N, D]
+        agg    = torch.einsum('bij,bjd->bid', weights, values) # [B, N, D]
+
+        # For isolated vessels, skip the aggregation (h unchanged)
+        agg = torch.where(isolated.expand_as(agg), torch.zeros_like(agg), agg)
+
+        return self.norm(h + agg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Main Model — Autoregressive CPA-GRN
+# 3. Main Model
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CPAGRN(nn.Module):
-    """
-    CPA-Aware Graph Recurrent Network with Autoregressive Decoder.
-
-    The key architectural change from v1: instead of applying spatial attention
-    once and decoding all steps simultaneously with an MLP, we use a GRU-based
-    autoregressive decoder that re-computes CPA edge features at every step
-    from the current predicted positions. This allows the model to track how
-    collision risk evolves over the prediction horizon.
-    """
+    """CPA-Aware Graph Recurrent Network with distance-threshold attention."""
 
     def __init__(
         self,
-        feature_size: int   = 4,
-        d_model:      int   = 64,
-        gru_layers:   int   = 1,
-        pred_len:     int   = 5,
-        dropout:      float = 0.0,
-        top_k:        int   = 20,
+        feature_size:   int   = 4,
+        d_model:        int   = 64,
+        gru_layers:     int   = 1,
+        pred_len:       int   = 5,
+        dropout:        float = 0.0,
+        dist_threshold: float = 0.05,
     ):
         super().__init__()
         self.d_model  = d_model
         self.pred_len = pred_len
-        self.gru_layers = gru_layers
 
-        # --- Encoder ---
         self.embed = nn.Sequential(
             nn.Linear(feature_size, d_model),
             nn.LayerNorm(d_model),
         )
-        self.encoder_gru = nn.GRU(
+
+        self.gru = nn.GRU(
             d_model, d_model,
             num_layers  = gru_layers,
             batch_first = True,
             dropout     = dropout if gru_layers > 1 else 0.0,
         )
 
-        # --- CPA edge features ---
         self.cpa_features = CPAFeatures()
-        self.spatial      = CPAAwareSpatialLayer(d_model, top_k=top_k)
+        self.spatial      = CPAAwareSpatialLayer(
+            d_model        = d_model,
+            edge_dim       = 7,
+            dist_threshold = dist_threshold,
+        )
 
-        # --- Autoregressive Decoder ---
-        # Input to decoder GRU: spatial-attended hidden state (d_model)
-        # + last predicted displacement (2) projected to d_model
-        self.disp_proj = nn.Linear(2, d_model)
-        self.decoder_gru = nn.GRUCell(d_model, d_model)
-
-        # Step output: predict displacement from decoder hidden state
-        self.step_mlp = nn.Sequential(
+        self.decoder = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
-            nn.Linear(d_model, 2),
+            nn.Linear(d_model, pred_len * 2),
         )
 
         self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, (nn.Linear,)):
+            if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
     def forward(
         self,
-        obs:  torch.Tensor,
-        mask: torch.Tensor | None = None,
+        obs:   torch.Tensor,
+        mask:  torch.Tensor | None = None,
+        stats: dict | None         = None,
     ) -> torch.Tensor:
-        """
-        obs:  [B, N, T_obs, 4]   (LON, LAT, SOG, Heading — z-score)
-        mask: [B, N] bool        (True = real vessel, False = padding)
-        Returns: [B, N, pred_len, 2]  (displacement in z-score space)
-        """
         B, N, T, _ = obs.shape
 
-        # ── 1. Encode observation sequence ───────────────────────────────────
-        x    = self.embed(obs)                        # [B, N, T, d_model]
+        # 1. Embed
+        x    = self.embed(obs)
         x_in = x.reshape(B * N, T, self.d_model)
-        _, h_n = self.encoder_gru(x_in)              # [layers, B*N, d_model]
-        # h_enc: [B, N, d_model] — last encoder hidden state per vessel
-        h_enc = h_n[-1].reshape(B, N, self.d_model)
+        _, h_n = self.gru(x_in)
+        h    = h_n[-1].reshape(B, N, self.d_model)
 
         if mask is not None:
-            h_enc = h_enc * mask.float().unsqueeze(-1)
+            h = h * mask.float().unsqueeze(-1)
 
-        # ── 2. Autoregressive decoding ───────────────────────────────────────
-        # Track current positions and velocities for CPA recomputation
-        # Start from last observed position and velocity
-        cur_pos = obs[:, :, -1, :2].clone()          # [B, N, 2]
-        cur_vel = (obs[:, :, -1, :2] - obs[:, :, -2, :2]
-                   if T >= 2 else torch.zeros_like(cur_pos))
-        cur_hdg = obs[:, :, -1, 3].clone()           # [B, N]
+        # 2. CPA-aware spatial attention (distance threshold)
+        edges = self.cpa_features(obs)               # [B, N, N, 7]
+        h     = self.spatial(h, edges, mask, stats)  # [B, N, d_model]
 
-        # Decoder GRU hidden state starts from encoder output
-        # GRUCell expects [B*N, d_model]
-        h_dec = h_enc.reshape(B * N, self.d_model)   # [B*N, d_model]
+        # 3. Decode
+        out = self.decoder(h).reshape(B, N, self.pred_len, 2)
 
-        # Initial "previous displacement" is zero
-        prev_disp = torch.zeros(B, N, 2, device=obs.device)
+        if mask is not None:
+            out = out * mask.float().unsqueeze(-1).unsqueeze(-1)
 
-        predictions = []
-
-        for t in range(self.pred_len):
-            # a. Compute CPA edge features from current positions
-            edges = self.cpa_features(cur_pos, cur_vel, cur_hdg)  # [B, N, N, 7]
-
-            # b. Spatial attention on current decoder hidden state
-            h_spatial = h_dec.reshape(B, N, self.d_model)
-            if mask is not None:
-                h_spatial = h_spatial * mask.float().unsqueeze(-1)
-            h_spatial = self.spatial(h_spatial, edges, mask)      # [B, N, d_model]
-
-            # c. Project previous displacement and combine with spatial context
-            disp_emb = self.disp_proj(prev_disp)                  # [B, N, d_model]
-            gru_input = (h_spatial + disp_emb).reshape(B * N, self.d_model)
-
-            # d. GRU decoder step
-            h_dec = self.decoder_gru(gru_input, h_dec)            # [B*N, d_model]
-
-            # e. Predict displacement for this step
-            disp_t = self.step_mlp(
-                h_dec.reshape(B, N, self.d_model)
-            )  # [B, N, 2]
-
-            if mask is not None:
-                disp_t = disp_t * mask.float().unsqueeze(-1)
-
-            predictions.append(disp_t)
-
-            # f. Update current position, velocity for next step
-            new_pos  = cur_pos + disp_t.detach()   # detach: no gradient through position update
-            cur_vel  = disp_t.detach()              # velocity = last displacement
-            cur_pos  = new_pos
-            # heading unchanged (we don't predict it)
-            prev_disp = disp_t
-
-        # Stack predictions: [B, N, pred_len, 2]
-        out = torch.stack(predictions, dim=2)
         return out
 
 
@@ -304,11 +275,11 @@ class CPAGRN(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cpagrn_loss(
-    pred_disp:   torch.Tensor,   # [B, N, pred_len, 2]
-    target_disp: torch.Tensor,   # [B, N, pred_len, 2]
-    mask:        torch.Tensor,   # [B, N] bool
+    pred_disp:   torch.Tensor,
+    target_disp: torch.Tensor,
+    mask:        torch.Tensor,
 ) -> torch.Tensor:
     sq_err = (pred_disp - target_disp) ** 2
-    sq_err = sq_err.sum(dim=-1)              # [B, N, pred_len]
+    sq_err = sq_err.sum(dim=-1)
     m      = mask.unsqueeze(-1).expand_as(sq_err)
     return sq_err[m].mean()
