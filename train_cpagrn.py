@@ -1,8 +1,7 @@
 """
-train_cpagrn.py — Training script for CPA-GRN (v3: distance threshold).
+train_cpagrn.py — Training script for CPA-GRN (v4: temporally-aware encoder).
 
 Identical setup to train_lstm.py for fair comparison.
-Passes global_stats to model.forward() for distance denormalization.
 
 Usage:
     python train_cpagrn.py --obs_len 5 --pred_len 5 --tag CPAGRN_obs5_pred5_s42
@@ -38,8 +37,6 @@ def get_args():
     p.add_argument('--gpu_num',        type=int,   default=0)
     p.add_argument('--tag',            type=str,   default='CPAGRN_obs5_pred5')
     p.add_argument('--log_every',      type=int,   default=10)
-    p.add_argument('--dist_threshold', type=float, default=0.05,
-                   help='Distance threshold in degrees (~3nm) for spatial attention')
     return p.parse_args()
 
 
@@ -114,11 +111,10 @@ def main():
     log.info(f'Train batches: {len(train_loader)} | Val batches: {len(val_loader)}')
 
     model = CPAGRN(
-        feature_size   = 4,
-        d_model        = args.d_model,
-        gru_layers     = args.gru_layers,
-        pred_len       = args.pred_len,
-        dist_threshold = args.dist_threshold,
+        feature_size = 4,
+        d_model      = args.d_model,
+        gru_layers   = args.gru_layers,
+        pred_len     = args.pred_len,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
