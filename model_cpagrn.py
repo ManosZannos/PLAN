@@ -1,25 +1,33 @@
 """
-model_cpagrn.py — CPA-Aware Graph Recurrent Network (v3: Distance Threshold)
+model_cpagrn.py — CPA-Aware Graph Recurrent Network (v4: Temporally-Aware Encoder)
 
-Novel contribution: TCPA/DCPA as differentiable edge features in spatial
-attention, with physics-informed distance masking.
+Novel contribution: TCPA/DCPA as differentiable edge features integrated
+directly into the GRU encoder at every observation timestep.
 
-Key change from v1/v2: instead of top_k nearest neighbors, we use a
-distance threshold of 0.05° (~3 nautical miles) to select neighbors.
-This is physically motivated: at typical vessel speeds (10-15 knots),
-only vessels within 3nm can realistically influence a vessel's trajectory
-within the 5-10 minute prediction horizon (COLREGS action range).
+Key architectural change from v1-v3:
+  Previous versions applied spatial attention ONCE after the encoder:
+    embed → GRU(obs) → spatial_attention → decode
 
-With N≈207 vessels per window and a 5°×5° area, most vessels are >20nm
-apart. The threshold ensures each vessel attends only to the 1-5 truly
-relevant neighbors, eliminating noise from distant vessels.
+  This version integrates spatial context AT EVERY ENCODER STEP:
+    for t in obs_len:
+        embed(obs_t) + aggregate_neighbors(t) → GRU_step → h_t
 
-Architecture (same as v1, only neighbor selection changes):
-  1. Feature Embedding    Linear(4 → d_model) + LayerNorm
-  2. GRU Encoder          per-vessel recurrence over obs_len steps
-  3. CPA-Aware Spatial    message passing with TCPA/DCPA edge features
-                          physics-informed: only neighbors within 0.05°
-  4. Decoder              MLP → pred_len displacements
+  This means the encoder hidden state h_T encodes not just "where I was"
+  but "how my relationship with neighbors evolved over the observation".
+  This temporal context is what allows the decoder to make better
+  predictions even when future interactions haven't happened yet.
+
+Architecture:
+  1. Feature Embedding      Linear(4 → d_model) + LayerNorm  (per vessel, per step)
+  2. Per-step CPA Aggregation
+       For each timestep t:
+         a. Compute CPA edge features from obs[:,:,t,:]
+         b. Sparse attention aggregation (top_k nearest neighbors)
+         c. Project aggregated message → d_model
+         d. Fuse: GRU input = embed(obs_t) + neighbor_msg_t
+  3. GRU Encoder            processes fused sequence [B*N, T, d_model]
+  4. Final Spatial Attention single pass on encoder output (optional refinement)
+  5. Decoder                MLP → pred_len displacements
 
 Input:  obs  [B, N, obs_len, 4]    (LON, LAT, SOG, Heading — z-score)
 Output: pred [B, N, pred_len, 2]   (displacement in z-score space)
@@ -31,20 +39,20 @@ import torch.nn.functional as F
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. CPA Feature Computation
+# 1. CPA Feature Computation (single timestep)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CPAFeatures(nn.Module):
     """
-    Computes 7 pairwise edge features from the last observed positions.
+    Computes 7 pairwise edge features for a single timestep snapshot.
 
     For each vessel pair (i → j):
-        TCPA  — time to closest point of approach
-        DCPA  — distance at closest point of approach
-        dist  — current Euclidean distance (z-score space)
+        TCPA          — time to closest point of approach
+        DCPA          — distance at closest point of approach
+        dist          — current Euclidean distance
         sin/cos(bearing) — direction from i to j
-        dhdg             — relative heading (z-score space)
-        dhdg.abs()       — absolute heading difference
+        dhdg          — relative heading (z-score space)
+        dhdg.abs()    — absolute heading difference
     """
 
     EDGE_DIM = 7
@@ -53,16 +61,14 @@ class CPAFeatures(nn.Module):
         super().__init__()
         self.eps = eps
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """
-        obs: [B, N, T_obs, 4]
-        Returns: [B, N, N, 7]
-        """
-        B, N, T, _ = obs.shape
-
-        pos = obs[:, :, -1, :2]
-        vel = pos - obs[:, :, -2, :2] if T >= 2 else torch.zeros_like(pos)
-        hdg = obs[:, :, -1, 3]
+    def forward(
+        self,
+        pos: torch.Tensor,   # [B, N, 2]  current positions
+        vel: torch.Tensor,   # [B, N, 2]  current velocities
+        hdg: torch.Tensor,   # [B, N]     current heading
+    ) -> torch.Tensor:
+        """Returns [B, N, N, 7]"""
+        B, N, _ = pos.shape
 
         pos_i = pos.unsqueeze(2).expand(B, N, N, 2)
         pos_j = pos.unsqueeze(1).expand(B, N, N, 2)
@@ -94,52 +100,49 @@ class CPAFeatures(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. CPA-Aware Spatial Attention Layer (distance threshold)
+# 2. Sparse Neighbor Aggregation (single timestep)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class CPAAwareSpatialLayer(nn.Module):
+class NeighborAggregation(nn.Module):
     """
-    CPA-aware message passing with physics-informed distance masking.
+    Aggregates neighbor messages at a single timestep.
 
-    Only vessels within dist_threshold degrees attend to each other.
-    At 0.05° (~3nm), this corresponds to the COLREGS action range for
-    vessels moving at typical speeds within a 5-10 minute horizon.
+    Each vessel collects a weighted sum of neighbor embeddings,
+    weighted by CPA-aware attention scores.
+    Uses top_k sparsity to focus on nearest neighbors.
 
-    If a vessel has NO neighbors within the threshold (isolated vessel),
-    it falls back to self-attention only (identity: h unchanged).
+    Output: [B, N, d_model] — aggregated neighbor context per vessel
     """
 
-    def __init__(
-        self,
-        d_model:        int   = 64,
-        edge_dim:       int   = 7,
-        dist_threshold: float = 0.05,   # degrees — ~3 nautical miles
-    ):
+    def __init__(self, d_model: int, edge_dim: int = 7, top_k: int = 10):
         super().__init__()
-        self.dist_threshold = dist_threshold
+        self.top_k = top_k
 
+        # Attention score: how relevant is vessel j to vessel i?
         self.attn_mlp = nn.Sequential(
-            nn.Linear(2 * d_model + edge_dim, d_model),
+            nn.Linear(d_model + edge_dim, d_model // 2),
             nn.ReLU(),
-            nn.Linear(d_model, 1),
+            nn.Linear(d_model // 2, 1),
         )
-        self.value_proj = nn.Linear(d_model, d_model)
-        self.norm       = nn.LayerNorm(d_model)
+        # Project neighbor embedding for message
+        self.msg_proj = nn.Linear(d_model, d_model)
+        # Project aggregated message to GRU input space
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm     = nn.LayerNorm(d_model)
 
     def forward(
         self,
-        h:     torch.Tensor,         # [B, N, d_model]
-        edges: torch.Tensor,         # [B, N, N, 7]
+        h:     torch.Tensor,         # [B, N, d_model]  current vessel embeddings
+        edges: torch.Tensor,         # [B, N, N, 7]     CPA edge features
         mask:  torch.Tensor | None,  # [B, N] bool
-        stats: dict | None = None,   # global_stats for denormalization
     ) -> torch.Tensor:
         B, N, D = h.shape
 
-        h_i = h.unsqueeze(2).expand(B, N, N, D)
-        h_j = h.unsqueeze(1).expand(B, N, N, D)
-
+        # Attention score based on edge features + neighbor embedding only
+        # (not query vessel embedding — keeps it lightweight for per-step use)
+        h_j    = h.unsqueeze(1).expand(B, N, N, D)   # neighbor embeddings
         scores = self.attn_mlp(
-            torch.cat([h_i, h_j, edges], dim=-1)
+            torch.cat([h_j, edges], dim=-1)
         ).squeeze(-1)  # [B, N, N]
 
         # Mask padded vessels
@@ -147,43 +150,27 @@ class CPAAwareSpatialLayer(nn.Module):
             mask_j = mask.unsqueeze(1).expand(B, N, N)
             scores = scores.masked_fill(~mask_j, float('-inf'))
 
-        # Physics-informed distance masking
-        # edges[..., 2] is dist in z-score space — convert to degrees
-        dist_norm = edges[..., 2]  # [B, N, N] — normalized distance
-
-        if stats is not None:
-            # Denormalize: dist_degrees = dist_norm * std_LON + mean_LON
-            # Use LON std as proxy for spatial scale (LAT and LON stds are similar)
-            lon_std  = stats['LON']['std']
-            lat_std  = stats['LAT']['std']
-            # Euclidean distance in degrees: sqrt((dLON*lon_std)^2 + (dLAT*lat_std)^2)
-            # We approximate with dist_norm * mean(lon_std, lat_std)
-            spatial_std = (lon_std + lat_std) / 2.0
-            dist_degrees = dist_norm * spatial_std
-        else:
-            # Fallback: treat normalized dist directly (less accurate)
-            dist_degrees = dist_norm
-
-        # Mask vessels beyond threshold
-        too_far = dist_degrees > self.dist_threshold
+        # Sparse: top_k nearest neighbors by distance
+        dist = edges[..., 2]  # [B, N, N]
         if mask is not None:
-            too_far = too_far | ~mask_j
-        scores = scores.masked_fill(too_far, float('-inf'))
+            dist_masked = dist.masked_fill(~mask_j, float('inf'))
+        else:
+            dist_masked = dist
 
-        weights = F.softmax(scores, dim=-1)  # [B, N, N]
+        if self.top_k < N:
+            k = min(self.top_k, N)
+            kth, _ = dist_masked.topk(k, dim=-1, largest=False)
+            threshold = kth[..., -1].unsqueeze(-1)
+            scores = scores.masked_fill(dist_masked > threshold, float('-inf'))
 
-        # Handle isolated vessels (all neighbors masked → NaN after softmax)
-        # Fall back to uniform self-attention (no message passing)
-        isolated = weights.isnan().all(dim=-1, keepdim=True)  # [B, N, 1]
-        weights   = torch.nan_to_num(weights, nan=0.0)
+        weights = F.softmax(scores, dim=-1)           # [B, N, N]
+        weights = torch.nan_to_num(weights, nan=0.0)
 
-        values = self.value_proj(h)                            # [B, N, D]
-        agg    = torch.einsum('bij,bjd->bid', weights, values) # [B, N, D]
+        # Aggregate neighbor messages
+        msgs = self.msg_proj(h)                        # [B, N, D]
+        agg  = torch.einsum('bij,bjd->bid', weights, msgs)  # [B, N, D]
 
-        # For isolated vessels, skip the aggregation (h unchanged)
-        agg = torch.where(isolated.expand_as(agg), torch.zeros_like(agg), agg)
-
-        return self.norm(h + agg)
+        return self.norm(self.out_proj(agg))           # [B, N, D]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,26 +178,42 @@ class CPAAwareSpatialLayer(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CPAGRN(nn.Module):
-    """CPA-Aware Graph Recurrent Network with distance-threshold attention."""
+    """
+    CPA-Aware Graph Recurrent Network with Temporally-Aware Encoder (v4).
+
+    The encoder processes each timestep with spatial context from neighbors,
+    allowing the GRU hidden state to encode the temporal evolution of
+    vessel interactions, not just individual vessel kinematics.
+    """
 
     def __init__(
         self,
-        feature_size:   int   = 4,
-        d_model:        int   = 64,
-        gru_layers:     int   = 1,
-        pred_len:       int   = 5,
-        dropout:        float = 0.0,
-        dist_threshold: float = 0.05,
+        feature_size: int   = 4,
+        d_model:      int   = 64,
+        gru_layers:   int   = 1,
+        pred_len:     int   = 5,
+        dropout:      float = 0.0,
+        top_k:        int   = 10,
     ):
         super().__init__()
         self.d_model  = d_model
         self.pred_len = pred_len
+        self.top_k    = top_k
 
+        # Per-step feature embedding
         self.embed = nn.Sequential(
             nn.Linear(feature_size, d_model),
             nn.LayerNorm(d_model),
         )
 
+        # CPA feature computation
+        self.cpa_features = CPAFeatures()
+
+        # Per-step neighbor aggregation
+        self.neighbor_agg = NeighborAggregation(d_model, top_k=top_k)
+
+        # GRU processes fused sequence (own embedding + neighbor context)
+        # Input dim = d_model (fused via residual addition)
         self.gru = nn.GRU(
             d_model, d_model,
             num_layers  = gru_layers,
@@ -218,13 +221,10 @@ class CPAGRN(nn.Module):
             dropout     = dropout if gru_layers > 1 else 0.0,
         )
 
-        self.cpa_features = CPAFeatures()
-        self.spatial      = CPAAwareSpatialLayer(
-            d_model        = d_model,
-            edge_dim       = 7,
-            dist_threshold = dist_threshold,
-        )
+        # Final spatial refinement after encoder (lightweight)
+        self.final_spatial = NeighborAggregation(d_model, top_k=top_k)
 
+        # Decoder
         self.decoder = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
@@ -242,26 +242,63 @@ class CPAGRN(nn.Module):
 
     def forward(
         self,
-        obs:   torch.Tensor,
-        mask:  torch.Tensor | None = None,
-        stats: dict | None         = None,
+        obs:  torch.Tensor,
+        mask: torch.Tensor | None = None,
+        stats: dict | None = None,   # kept for API compatibility
     ) -> torch.Tensor:
-        B, N, T, _ = obs.shape
+        B, N, T, F = obs.shape
 
-        # 1. Embed
-        x    = self.embed(obs)
-        x_in = x.reshape(B * N, T, self.d_model)
-        _, h_n = self.gru(x_in)
-        h    = h_n[-1].reshape(B, N, self.d_model)
+        # ── 1. Per-step embedding ──────────────────────────────────────────────
+        x = self.embed(obs)   # [B, N, T, d_model]
+
+        # ── 2. Per-step neighbor aggregation ──────────────────────────────────
+        # For each timestep t, compute CPA features and aggregate neighbors
+        # Result: fused sequence [B, N, T, d_model]
+        fused_steps = []
+
+        for t in range(T):
+            # Current state at timestep t
+            pos_t = obs[:, :, t, :2]                  # [B, N, 2]
+            hdg_t = obs[:, :, t, 3]                   # [B, N]
+
+            # Velocity: use finite difference (or zero for first step)
+            if t == 0:
+                vel_t = torch.zeros_like(pos_t)
+            else:
+                vel_t = obs[:, :, t, :2] - obs[:, :, t-1, :2]  # [B, N, 2]
+
+            # CPA edge features at this timestep
+            edges_t = self.cpa_features(pos_t, vel_t, hdg_t)    # [B, N, N, 7]
+
+            # Neighbor aggregation using current embeddings
+            x_t     = x[:, :, t, :]                              # [B, N, d_model]
+            nbr_t   = self.neighbor_agg(x_t, edges_t, mask)      # [B, N, d_model]
+
+            # Fuse: own embedding + neighbor context (residual)
+            fused_t = x_t + nbr_t                                 # [B, N, d_model]
+            fused_steps.append(fused_t)
+
+        # Stack back to sequence: [B, N, T, d_model]
+        fused_seq = torch.stack(fused_steps, dim=2)
+
+        # ── 3. GRU Encoder ─────────────────────────────────────────────────────
+        gru_in = fused_seq.reshape(B * N, T, self.d_model)
+        _, h_n = self.gru(gru_in)                     # [layers, B*N, d_model]
+        h      = h_n[-1].reshape(B, N, self.d_model)  # [B, N, d_model]
 
         if mask is not None:
             h = h * mask.float().unsqueeze(-1)
 
-        # 2. CPA-aware spatial attention (distance threshold)
-        edges = self.cpa_features(obs)               # [B, N, N, 7]
-        h     = self.spatial(h, edges, mask, stats)  # [B, N, d_model]
+        # ── 4. Final spatial refinement ────────────────────────────────────────
+        # One more aggregation pass on encoder output using last-step CPA
+        pos_last = obs[:, :, -1, :2]
+        vel_last = obs[:, :, -1, :2] - obs[:, :, -2, :2] if T >= 2 \
+                   else torch.zeros_like(pos_last)
+        hdg_last = obs[:, :, -1, 3]
+        edges_last = self.cpa_features(pos_last, vel_last, hdg_last)
+        h = h + self.final_spatial(h, edges_last, mask)
 
-        # 3. Decode
+        # ── 5. Decode ──────────────────────────────────────────────────────────
         out = self.decoder(h).reshape(B, N, self.pred_len, 2)
 
         if mask is not None:
