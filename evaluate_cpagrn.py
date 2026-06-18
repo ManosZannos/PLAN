@@ -49,15 +49,11 @@ def main():
     stats = ckpt.get('stats', None)
     print(f'Loaded epoch {ckpt["epoch"]}  val_loss={ckpt.get("val_loss","?"):.6f}')
 
-    # Model — load dist_threshold from checkpoint if available
-    dist_threshold = saved.get('dist_threshold', 0.05)
-
     model = CPAGRN(
-        feature_size   = 4,
-        d_model        = saved.get('d_model',    64),
-        gru_layers     = saved.get('gru_layers', 1),
-        pred_len       = saved.get('pred_len',   args.pred_len),
-        dist_threshold = dist_threshold,
+        feature_size = 4,
+        d_model      = saved.get('d_model',    64),
+        gru_layers   = saved.get('gru_layers', 1),
+        pred_len     = saved.get('pred_len',   args.pred_len),
     ).to(device)
     model.load_state_dict(ckpt['model'])
     model.eval()
