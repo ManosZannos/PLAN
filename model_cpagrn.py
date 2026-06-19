@@ -1,15 +1,19 @@
 """
-model_cpagrn.py — CPA-Aware Graph Recurrent Network (v4, top_k=20)
+model_cpagrn.py — CPA-Aware Graph Recurrent Network (v4 + Gated Fusion)
 
-Identical to v4 (Temporally-Aware Encoder) but with top_k=20 instead of 10.
-Testing whether more neighbors improves 5min prediction.
+Change from v4: instead of simple residual addition of neighbor context,
+uses a learned gate to control how much spatial information to incorporate
+at each timestep:
 
-Architecture:
-  1. Feature Embedding      Linear(4 → d_model) + LayerNorm
-  2. Per-step CPA Aggregation (neighbor-only attention, top_k=20)
-  3. GRU Encoder
-  4. Final Spatial Refinement
-  5. Decoder MLP → pred_len displacements
+    gate    = sigmoid(W * [x_t, nbr_t])
+    fused_t = x_t + gate * nbr_t
+
+This allows the model to:
+- Close the gate when no relevant neighbors exist (isolated vessel)
+- Open the gate when a vessel is in a high-risk CPA situation
+- Learn the optimal fusion ratio per timestep automatically
+
+All other architecture details identical to v4 (top_k=10).
 """
 
 import torch
@@ -53,9 +57,9 @@ class CPAFeatures(nn.Module):
 
 
 class NeighborAggregation(nn.Module):
-    """Neighbor-only attention (v4 style), configurable top_k."""
+    """Neighbor-only attention with top_k sparsity (v4 style)."""
 
-    def __init__(self, d_model: int, edge_dim: int = 7, top_k: int = 20):
+    def __init__(self, d_model: int, edge_dim: int = 7, top_k: int = 10):
         super().__init__()
         self.top_k = top_k
 
@@ -102,7 +106,7 @@ class NeighborAggregation(nn.Module):
 
 
 class CPAGRN(nn.Module):
-    """CPA-GRN v4 with top_k=20."""
+    """CPA-GRN v4 with Gated Fusion."""
 
     def __init__(
         self,
@@ -125,6 +129,9 @@ class CPAGRN(nn.Module):
 
         self.cpa_features = CPAFeatures()
         self.neighbor_agg = NeighborAggregation(d_model, top_k=top_k)
+
+        # Gating: learns how much neighbor context to use per vessel per step
+        self.gate_proj = nn.Linear(2 * d_model, d_model)
 
         self.gru = nn.GRU(
             d_model, d_model,
@@ -153,7 +160,7 @@ class CPAGRN(nn.Module):
     def forward(self, obs, mask=None, stats=None):
         B, N, T, _ = obs.shape
 
-        x = self.embed(obs)
+        x = self.embed(obs)  # [B, N, T, d_model]
 
         fused_steps = []
         for t in range(T):
@@ -163,11 +170,18 @@ class CPAGRN(nn.Module):
                     else torch.zeros_like(pos_t)
 
             edges_t = self.cpa_features(pos_t, vel_t, hdg_t)
-            x_t     = x[:, :, t, :]
-            nbr_t   = self.neighbor_agg(x_t, edges_t, mask)
-            fused_steps.append(x_t + nbr_t)
+            x_t     = x[:, :, t, :]                          # [B, N, d_model]
+            nbr_t   = self.neighbor_agg(x_t, edges_t, mask)  # [B, N, d_model]
 
-        fused_seq = torch.stack(fused_steps, dim=2)
+            # Gated fusion: gate controls how much neighbor info to use
+            gate    = torch.sigmoid(
+                self.gate_proj(torch.cat([x_t, nbr_t], dim=-1))
+            )  # [B, N, d_model]
+            fused_t = x_t + gate * nbr_t
+
+            fused_steps.append(fused_t)
+
+        fused_seq = torch.stack(fused_steps, dim=2)  # [B, N, T, d_model]
 
         gru_in = fused_seq.reshape(B * N, T, self.d_model)
         _, h_n = self.gru(gru_in)
