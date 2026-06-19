@@ -1,26 +1,15 @@
 """
-model_cpagrn.py — CPA-Aware Graph Recurrent Network (v5)
+model_cpagrn.py — CPA-Aware Graph Recurrent Network (v4, top_k=20)
 
-Changes from v4:
-  - NeighborAggregation now includes query vessel embedding (h_i) in attention
-    score computation, following standard GAT design: score = f(h_i, h_j, edges)
-    This allows each vessel to weight neighbors based on its own state,
-    not just the neighbor's state and edge features.
+Identical to v4 (Temporally-Aware Encoder) but with top_k=20 instead of 10.
+Testing whether more neighbors improves 5min prediction.
 
 Architecture:
   1. Feature Embedding      Linear(4 → d_model) + LayerNorm
-  2. Per-step CPA Aggregation (query-aware attention)
-       For each timestep t:
-         a. Compute CPA edge features from obs[:,:,t,:]
-         b. Query-aware sparse attention: score = f(h_i, h_j, edges)
-         c. Aggregate neighbor messages
-         d. Fuse: GRU input = embed(obs_t) + neighbor_msg_t
+  2. Per-step CPA Aggregation (neighbor-only attention, top_k=20)
   3. GRU Encoder
-  4. Final Spatial Refinement (query-aware)
+  4. Final Spatial Refinement
   5. Decoder MLP → pred_len displacements
-
-Input:  obs  [B, N, obs_len, 4]    (LON, LAT, SOG, Heading — z-score)
-Output: pred [B, N, pred_len, 2]   (displacement in z-score space)
 """
 
 import torch
@@ -28,35 +17,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. CPA Feature Computation
-# ─────────────────────────────────────────────────────────────────────────────
-
 class CPAFeatures(nn.Module):
-    """
-    Computes 7 pairwise edge features for a single timestep snapshot.
-
-    For each vessel pair (i → j):
-        TCPA             — time to closest point of approach
-        DCPA             — distance at closest point of approach
-        dist             — current Euclidean distance
-        sin/cos(bearing) — direction from i to j
-        dhdg             — relative heading (z-score space)
-        dhdg.abs()       — absolute heading difference
-    """
-
     EDGE_DIM = 7
 
     def __init__(self, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
 
-    def forward(
-        self,
-        pos: torch.Tensor,   # [B, N, 2]
-        vel: torch.Tensor,   # [B, N, 2]
-        hdg: torch.Tensor,   # [B, N]
-    ) -> torch.Tensor:
+    def forward(self, pos, vel, hdg):
         B, N, _ = pos.shape
 
         pos_i = pos.unsqueeze(2).expand(B, N, N, 2)
@@ -84,30 +52,15 @@ class CPAFeatures(nn.Module):
         ], dim=-1)  # [B, N, N, 7]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Query-Aware Neighbor Aggregation
-# ─────────────────────────────────────────────────────────────────────────────
-
 class NeighborAggregation(nn.Module):
-    """
-    Query-aware sparse neighbor aggregation.
+    """Neighbor-only attention (v4 style), configurable top_k."""
 
-    Key change from v4: attention score now includes the query vessel
-    embedding h_i, following standard GAT design:
-        score(i→j) = f(h_i, h_j, edge_ij)
-
-    This allows vessel i to weight neighbors based on its OWN state,
-    not just the neighbor's state. For example, a vessel already turning
-    should weight differently than one on a straight course.
-    """
-
-    def __init__(self, d_model: int, edge_dim: int = 7, top_k: int = 10):
+    def __init__(self, d_model: int, edge_dim: int = 7, top_k: int = 20):
         super().__init__()
         self.top_k = top_k
 
-        # Query-aware: takes h_i + h_j + edge features
         self.attn_mlp = nn.Sequential(
-            nn.Linear(2 * d_model + edge_dim, d_model // 2),
+            nn.Linear(d_model + edge_dim, d_model // 2),
             nn.ReLU(),
             nn.Linear(d_model // 2, 1),
         )
@@ -115,28 +68,18 @@ class NeighborAggregation(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.norm     = nn.LayerNorm(d_model)
 
-    def forward(
-        self,
-        h:     torch.Tensor,         # [B, N, d_model]
-        edges: torch.Tensor,         # [B, N, N, 7]
-        mask:  torch.Tensor | None,  # [B, N] bool
-    ) -> torch.Tensor:
+    def forward(self, h, edges, mask):
         B, N, D = h.shape
 
-        # Query-aware attention: include both h_i and h_j
-        h_i = h.unsqueeze(2).expand(B, N, N, D)  # query vessel
-        h_j = h.unsqueeze(1).expand(B, N, N, D)  # neighbor vessel
-
+        h_j    = h.unsqueeze(1).expand(B, N, N, D)
         scores = self.attn_mlp(
-            torch.cat([h_i, h_j, edges], dim=-1)
-        ).squeeze(-1)  # [B, N, N]
+            torch.cat([h_j, edges], dim=-1)
+        ).squeeze(-1)
 
-        # Mask padded vessels
         if mask is not None:
             mask_j = mask.unsqueeze(1).expand(B, N, N)
             scores = scores.masked_fill(~mask_j, float('-inf'))
 
-        # Sparse: top_k nearest neighbors by distance
         dist = edges[..., 2]
         if mask is not None:
             dist_masked = dist.masked_fill(~mask_j, float('inf'))
@@ -158,12 +101,8 @@ class NeighborAggregation(nn.Module):
         return self.norm(self.out_proj(agg))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Main Model
-# ─────────────────────────────────────────────────────────────────────────────
-
 class CPAGRN(nn.Module):
-    """CPA-Aware Graph Recurrent Network (v5: Query-Aware Attention)."""
+    """CPA-GRN v4 with top_k=20."""
 
     def __init__(
         self,
@@ -172,7 +111,7 @@ class CPAGRN(nn.Module):
         gru_layers:   int   = 1,
         pred_len:     int   = 5,
         dropout:      float = 0.0,
-        top_k:        int   = 10,
+        top_k:        int   = 20,
     ):
         super().__init__()
         self.d_model  = d_model
@@ -211,18 +150,11 @@ class CPAGRN(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(
-        self,
-        obs:   torch.Tensor,
-        mask:  torch.Tensor | None = None,
-        stats: dict | None         = None,
-    ) -> torch.Tensor:
+    def forward(self, obs, mask=None, stats=None):
         B, N, T, _ = obs.shape
 
-        # 1. Embed
-        x = self.embed(obs)  # [B, N, T, d_model]
+        x = self.embed(obs)
 
-        # 2. Per-step query-aware neighbor aggregation
         fused_steps = []
         for t in range(T):
             pos_t = obs[:, :, t, :2]
@@ -235,9 +167,8 @@ class CPAGRN(nn.Module):
             nbr_t   = self.neighbor_agg(x_t, edges_t, mask)
             fused_steps.append(x_t + nbr_t)
 
-        fused_seq = torch.stack(fused_steps, dim=2)  # [B, N, T, d_model]
+        fused_seq = torch.stack(fused_steps, dim=2)
 
-        # 3. GRU Encoder
         gru_in = fused_seq.reshape(B * N, T, self.d_model)
         _, h_n = self.gru(gru_in)
         h      = h_n[-1].reshape(B, N, self.d_model)
@@ -245,7 +176,6 @@ class CPAGRN(nn.Module):
         if mask is not None:
             h = h * mask.float().unsqueeze(-1)
 
-        # 4. Final spatial refinement
         pos_last   = obs[:, :, -1, :2]
         vel_last   = obs[:, :, -1, :2] - obs[:, :, -2, :2] if T >= 2 \
                      else torch.zeros_like(pos_last)
@@ -253,7 +183,6 @@ class CPAGRN(nn.Module):
         edges_last = self.cpa_features(pos_last, vel_last, hdg_last)
         h = h + self.final_spatial(h, edges_last, mask)
 
-        # 5. Decode
         out = self.decoder(h).reshape(B, N, self.pred_len, 2)
 
         if mask is not None:
@@ -262,15 +191,7 @@ class CPAGRN(nn.Module):
         return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Loss
-# ─────────────────────────────────────────────────────────────────────────────
-
-def cpagrn_loss(
-    pred_disp:   torch.Tensor,
-    target_disp: torch.Tensor,
-    mask:        torch.Tensor,
-) -> torch.Tensor:
+def cpagrn_loss(pred_disp, target_disp, mask):
     sq_err = (pred_disp - target_disp) ** 2
     sq_err = sq_err.sum(dim=-1)
     m      = mask.unsqueeze(-1).expand_as(sq_err)
