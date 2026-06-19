@@ -111,7 +111,7 @@ class CPAGRN(nn.Module):
         gru_layers:   int   = 1,
         pred_len:     int   = 5,
         dropout:      float = 0.0,
-        top_k:        int   = 20,
+        top_k:        int   = 10,
     ):
         super().__init__()
         self.d_model  = d_model
