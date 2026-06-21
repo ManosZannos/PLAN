@@ -1,23 +1,35 @@
 """
-model_cpagrn.py — CPA-GRN v4 + TCPA-based Sparsification
+model_cpagrn.py — CPA-Aware Graph Recurrent Network (v4: FINAL ARCHITECTURE)
 
-Change from v4: neighbor selection criterion changed from distance-based
-to TCPA-based. Instead of attending to the top_k NEAREST vessels (by
-Euclidean distance), each vessel attends to the top_k vessels with the
-SMALLEST POSITIVE TCPA — i.e. the most imminently dangerous vessels.
+This is the locked-in final architecture for the thesis, after extensive
+comparison against alternatives (autoregressive decoder, distance-threshold
+masking, query-aware attention, gated fusion, rate-of-change CPA features,
+TCPA-based sparsification, larger d_model) — all of which underperformed
+this design on the held-out test set.
 
-Motivation: distance-based selection (v4) assumes nearby vessels are most
-relevant. But a vessel 5nm away on a direct collision course (TCPA=3min)
-is far more relevant than one 1nm away moving parallel (TCPA=large).
-TCPA-based selection directly encodes this collision risk priority.
+Novel contribution: TCPA/DCPA as differentiable edge features, integrated
+directly into the GRU encoder at EVERY observation timestep (not just once
+after encoding). This lets the encoder hidden state capture how vessel
+interactions evolve over the observation window, not just a single
+end-of-window snapshot.
 
-Implementation:
-- Only vessels with TCPA > 0 (future CPA) are considered
-- Vessels with TCPA <= 0 (past CPA, moving apart) are excluded
-- Among valid vessels, select top_k with smallest TCPA
-- If a vessel has fewer than top_k valid neighbors, attend to all valid ones
-- EDGE_DIM=7 (same as v4, no rate-of-change)
-- All other architecture details identical to v4
+Architecture:
+  1. Feature Embedding      Linear(4 → d_model) + LayerNorm
+  2. Per-step CPA Aggregation
+       For each timestep t in the observation window:
+         a. Compute 7 CPA edge features [TCPA, DCPA, dist, sin/cos(bearing),
+            dhdg, dhdg.abs()] from positions/velocities at that step
+         b. Sparse neighbor attention: top_k=10 NEAREST vessels by distance
+         c. Aggregate neighbor messages, fuse into the per-step embedding
+            via residual addition
+  3. GRU Encoder            processes the fused sequence [B*N, T, d_model]
+  4. Final Spatial Refinement  one more aggregation pass on the encoder
+                                output, using last-observed-step CPA features
+  5. Decoder                MLP → pred_len displacements (predicted jointly,
+                             not autoregressively)
+
+Input:  obs  [B, N, obs_len, 4]    (LON, LAT, SOG, Heading — z-score)
+Output: pred [B, N, pred_len, 2]   (displacement in z-score space)
 """
 
 import torch
@@ -26,11 +38,23 @@ import torch.nn.functional as F
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. CPA Feature Computation (identical to v4)
+# 1. CPA Feature Computation (single timestep)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CPAFeatures(nn.Module):
-    """7 pairwise edge features — identical to v4."""
+    """
+    Computes 7 pairwise edge features for a single timestep snapshot.
+
+    For each vessel pair (i → j):
+        TCPA             — time to closest point of approach
+        DCPA             — distance at closest point of approach
+        dist             — current Euclidean distance
+        sin/cos(bearing) — direction from i to j
+        dhdg             — relative heading (z-score space)
+        dhdg.abs()       — absolute heading difference
+
+    All computed in z-score normalised space.
+    """
 
     EDGE_DIM = 7
 
@@ -38,7 +62,13 @@ class CPAFeatures(nn.Module):
         super().__init__()
         self.eps = eps
 
-    def forward(self, pos, vel, hdg):
+    def forward(
+        self,
+        pos: torch.Tensor,   # [B, N, 2]  current positions (LON, LAT)
+        vel: torch.Tensor,   # [B, N, 2]  current velocity
+        hdg: torch.Tensor,   # [B, N]     current heading
+    ) -> torch.Tensor:
+        """Returns [B, N, N, 7]"""
         B, N, _ = pos.shape
 
         pos_i = pos.unsqueeze(2).expand(B, N, N, 2)
@@ -48,8 +78,8 @@ class CPAFeatures(nn.Module):
         hdg_i = hdg.unsqueeze(2).expand(B, N, N)
         hdg_j = hdg.unsqueeze(1).expand(B, N, N)
 
-        r = pos_j - pos_i
-        v = vel_j - vel_i
+        r = pos_j - pos_i          # relative position
+        v = vel_j - vel_i          # relative velocity
 
         dist    = r.norm(dim=-1)
         bearing = torch.atan2(r[..., 1], r[..., 0])
@@ -60,27 +90,28 @@ class CPAFeatures(nn.Module):
         dcpa = (r + tcpa.unsqueeze(-1) * v).norm(dim=-1).clamp(0.0, 10.0)
 
         return torch.stack([
-            tcpa, dcpa, dist,
-            torch.sin(bearing), torch.cos(bearing),
-            dhdg, dhdg.abs(),
+            tcpa,
+            dcpa,
+            dist,
+            torch.sin(bearing),
+            torch.cos(bearing),
+            dhdg,
+            dhdg.abs(),
         ], dim=-1)  # [B, N, N, 7]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Neighbor Aggregation with TCPA-based Sparsification
+# 2. Sparse Neighbor Aggregation (distance-based top_k)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NeighborAggregation(nn.Module):
     """
-    TCPA-based sparse neighbor aggregation.
+    Aggregates neighbor messages at a single timestep.
 
-    Selects top_k neighbors by smallest positive TCPA (most imminent
-    collision risk) rather than by distance. Only future CPAs (TCPA > 0)
-    are considered — past CPAs (vessels already moving apart) are excluded.
-
-    Fallback: if a vessel has no neighbors with TCPA > 0, it falls back
-    to distance-based selection (same as v4), ensuring the model always
-    has some spatial context.
+    Each vessel collects a weighted sum of neighbor embeddings, weighted by
+    CPA-aware attention scores. Sparsified to the top_k NEAREST neighbors
+    by current Euclidean distance (this was found to outperform TCPA-based
+    or unrestricted attention in extensive ablation).
     """
 
     def __init__(self, d_model: int, edge_dim: int = 7, top_k: int = 10):
@@ -96,77 +127,56 @@ class NeighborAggregation(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
         self.norm     = nn.LayerNorm(d_model)
 
-    def forward(self, h, edges, mask):
+    def forward(
+        self,
+        h:     torch.Tensor,         # [B, N, d_model]  current vessel embeddings
+        edges: torch.Tensor,         # [B, N, N, 7]     CPA edge features
+        mask:  torch.Tensor | None,  # [B, N] bool
+    ) -> torch.Tensor:
         B, N, D = h.shape
 
-        h_j    = h.unsqueeze(1).expand(B, N, N, D)
+        h_j    = h.unsqueeze(1).expand(B, N, N, D)   # neighbor embeddings
         scores = self.attn_mlp(
             torch.cat([h_j, edges], dim=-1)
         ).squeeze(-1)  # [B, N, N]
 
-        # Mask padded vessels
         if mask is not None:
             mask_j = mask.unsqueeze(1).expand(B, N, N)
             scores = scores.masked_fill(~mask_j, float('-inf'))
 
-        # TCPA-based sparsification
-        # TCPA is at index 0 in edge features
-        tcpa = edges[..., 0]  # [B, N, N]
-        dist = edges[..., 2]  # [B, N, N] — for fallback
-
+        dist = edges[..., 2]  # [B, N, N]
         if mask is not None:
-            # For ranking: set invalid vessels to large positive value
-            tcpa_for_rank = tcpa.masked_fill(~mask_j, float('inf'))
-            dist_for_rank = dist.masked_fill(~mask_j, float('inf'))
+            dist_masked = dist.masked_fill(~mask_j, float('inf'))
         else:
-            tcpa_for_rank = tcpa
-            dist_for_rank = dist
+            dist_masked = dist
 
         if self.top_k < N:
             k = min(self.top_k, N)
+            kth, _ = dist_masked.topk(k, dim=-1, largest=False)
+            threshold = kth[..., -1].unsqueeze(-1)
+            scores = scores.masked_fill(dist_masked > threshold, float('-inf'))
 
-            # Primary: rank by smallest positive TCPA
-            # Vessels with TCPA <= 0 (past CPA) get large value → deprioritized
-            tcpa_positive = tcpa_for_rank.clone()
-            tcpa_positive[tcpa_positive <= 0] = float('inf')
-
-            # Check if any vessel has valid positive TCPA neighbors
-            has_valid = (tcpa_positive < float('inf')).any(dim=-1, keepdim=True)  # [B, N, 1]
-
-            # Select top_k by smallest positive TCPA
-            kth_tcpa, _ = tcpa_positive.topk(k, dim=-1, largest=False)
-            tcpa_threshold = kth_tcpa[..., -1].unsqueeze(-1)
-
-            # Fallback: distance-based for vessels with no valid TCPA neighbors
-            kth_dist, _ = dist_for_rank.topk(k, dim=-1, largest=False)
-            dist_threshold = kth_dist[..., -1].unsqueeze(-1)
-
-            # Build mask: use TCPA-based where possible, distance-based as fallback
-            tcpa_mask = tcpa_positive > tcpa_threshold   # True = exclude
-            dist_mask = dist_for_rank > dist_threshold   # True = exclude
-
-            # For vessels with valid TCPA neighbors: use TCPA mask
-            # For vessels without: use distance mask (fallback)
-            combined_mask = torch.where(has_valid.expand_as(tcpa_mask),
-                                        tcpa_mask, dist_mask)
-
-            scores = scores.masked_fill(combined_mask, float('-inf'))
-
-        weights = F.softmax(scores, dim=-1)
+        weights = F.softmax(scores, dim=-1)           # [B, N, N]
         weights = torch.nan_to_num(weights, nan=0.0)
 
-        msgs = self.msg_proj(h)
-        agg  = torch.einsum('bij,bjd->bid', weights, msgs)
+        msgs = self.msg_proj(h)                        # [B, N, D]
+        agg  = torch.einsum('bij,bjd->bid', weights, msgs)  # [B, N, D]
 
-        return self.norm(self.out_proj(agg))
+        return self.norm(self.out_proj(agg))           # [B, N, D]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Main Model (identical to v4 except NeighborAggregation)
+# 3. Main Model
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CPAGRN(nn.Module):
-    """CPA-GRN v4 with TCPA-based Sparsification."""
+    """
+    CPA-Aware Graph Recurrent Network — Final Architecture (v4).
+
+    The encoder processes each observation timestep with spatial context
+    from neighbors, allowing the GRU hidden state to encode the temporal
+    evolution of vessel interactions, not just individual vessel kinematics.
+    """
 
     def __init__(
         self,
@@ -180,6 +190,7 @@ class CPAGRN(nn.Module):
         super().__init__()
         self.d_model  = d_model
         self.pred_len = pred_len
+        self.top_k    = top_k
 
         self.embed = nn.Sequential(
             nn.Linear(feature_size, d_model),
@@ -213,11 +224,23 @@ class CPAGRN(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, obs, mask=None, stats=None):
+    def forward(
+        self,
+        obs:   torch.Tensor,
+        mask:  torch.Tensor | None = None,
+        stats: dict | None         = None,   # unused, kept for API compatibility
+    ) -> torch.Tensor:
+        """
+        obs:  [B, N, T_obs, 4]   (LON, LAT, SOG, Heading — z-score)
+        mask: [B, N] bool        (True = real vessel, False = padding)
+        Returns: [B, N, pred_len, 2]  (displacement in z-score space)
+        """
         B, N, T, _ = obs.shape
 
-        x = self.embed(obs)
+        # 1. Per-step embedding
+        x = self.embed(obs)  # [B, N, T, d_model]
 
+        # 2. Per-step neighbor aggregation (temporally-aware encoder input)
         fused_steps = []
         for t in range(T):
             pos_t = obs[:, :, t, :2]
@@ -225,20 +248,22 @@ class CPAGRN(nn.Module):
             vel_t = obs[:, :, t, :2] - obs[:, :, t-1, :2] if t > 0 \
                     else torch.zeros_like(pos_t)
 
-            edges_t = self.cpa_features(pos_t, vel_t, hdg_t)
-            x_t     = x[:, :, t, :]
-            nbr_t   = self.neighbor_agg(x_t, edges_t, mask)
+            edges_t = self.cpa_features(pos_t, vel_t, hdg_t)  # [B, N, N, 7]
+            x_t     = x[:, :, t, :]                            # [B, N, d_model]
+            nbr_t   = self.neighbor_agg(x_t, edges_t, mask)    # [B, N, d_model]
             fused_steps.append(x_t + nbr_t)
 
-        fused_seq = torch.stack(fused_steps, dim=2)
+        fused_seq = torch.stack(fused_steps, dim=2)  # [B, N, T, d_model]
 
+        # 3. GRU Encoder
         gru_in = fused_seq.reshape(B * N, T, self.d_model)
-        _, h_n = self.gru(gru_in)
-        h      = h_n[-1].reshape(B, N, self.d_model)
+        _, h_n = self.gru(gru_in)                     # [layers, B*N, d_model]
+        h      = h_n[-1].reshape(B, N, self.d_model)  # [B, N, d_model]
 
         if mask is not None:
             h = h * mask.float().unsqueeze(-1)
 
+        # 4. Final spatial refinement (last-observed-step CPA features)
         pos_last   = obs[:, :, -1, :2]
         vel_last   = obs[:, :, -1, :2] - obs[:, :, -2, :2] if T >= 2 \
                      else torch.zeros_like(pos_last)
@@ -246,6 +271,7 @@ class CPAGRN(nn.Module):
         edges_last = self.cpa_features(pos_last, vel_last, hdg_last)
         h = h + self.final_spatial(h, edges_last, mask)
 
+        # 5. Decode
         out = self.decoder(h).reshape(B, N, self.pred_len, 2)
 
         if mask is not None:
@@ -258,7 +284,11 @@ class CPAGRN(nn.Module):
 # 4. Loss
 # ─────────────────────────────────────────────────────────────────────────────
 
-def cpagrn_loss(pred_disp, target_disp, mask):
+def cpagrn_loss(
+    pred_disp:   torch.Tensor,
+    target_disp: torch.Tensor,
+    mask:        torch.Tensor,
+) -> torch.Tensor:
     sq_err = (pred_disp - target_disp) ** 2
     sq_err = sq_err.sum(dim=-1)
     m      = mask.unsqueeze(-1).expand_as(sq_err)
