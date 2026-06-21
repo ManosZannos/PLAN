@@ -160,28 +160,27 @@ def main():
 
             # ── 2) Best-of-K reference (paper protocol), in DEGREES ──
             if not args.skip_best_of_k:
-                # Convert target velocity-space Gaussian mean trick doesn't apply here;
-                # paper's best-of-K samples velocity-space Gaussian, then we must also
-                # convert sampled velocity trajectories to absolute positions the same
-                # way as the deterministic path, per-sample. We reuse evaluate_best_of_k
-                # on velocity space target/pred is NOT directly meaningful for absolute
-                # ADE, so we sample manually and accumulate to absolute space here.
+                # IMPORTANT: sample selection must happen in DEGREE space, not
+                # z-score space, to faithfully match the original evaluate.py
+                # protocol. LON and LAT have different z-score stds, so ranking
+                # samples by z-score-space distance can select a different
+                # "best" sample than ranking by true geographic distance.
                 from metrics_smchn import sample_bivariate_gaussian
                 samples_vel = sample_bivariate_gaussian(V_pred, args.num_samples)  # [K,T_pred,N_valid,2]
                 samples_abs = torch.cumsum(samples_vel, dim=1) + last_obs_pos.unsqueeze(0).unsqueeze(0)
+                # samples_abs: [K, T_pred, N_valid, 2] — still z-score space
 
-                target_abs_exp = abs_pred_target.unsqueeze(0)  # [1, T_pred, N_valid, 2]
-                disp = torch.sqrt(
-                    ((samples_abs - target_abs_exp) ** 2).sum(dim=-1)
-                )  # [K, T_pred, N_valid] — z-score space distances (not degrees yet)
+                samples_abs_np = samples_abs.cpu().numpy()
+                samp_lon = denorm(samples_abs_np[:, :, :, 0], lon_mean, lon_std)  # [K, T_pred, N_valid]
+                samp_lat = denorm(samples_abs_np[:, :, :, 1], lat_mean, lat_std)
 
-                ade_per_sample = disp.mean(dim=[1, 2])           # [K]
-                best_idx = torch.argmin(ade_per_sample)
-                best_abs = samples_abs[best_idx].cpu().numpy()   # [T_pred, N_valid, 2]
+                # Per-sample displacement to target, in DEGREES (matches original protocol)
+                disp_deg = l2_degrees(samp_lat, samp_lon,
+                                       true_lat[None, :, :], true_lon[None, :, :])  # [K, T_pred, N_valid]
 
-                best_lon = denorm(best_abs[:, :, 0], lon_mean, lon_std)
-                best_lat = denorm(best_abs[:, :, 1], lat_mean, lat_std)
-                best_err = l2_degrees(best_lat, best_lon, true_lat, true_lon)  # [T_pred, N_valid]
+                ade_per_sample = disp_deg.mean(axis=(1, 2))           # [K], in degrees
+                best_idx = int(np.argmin(ade_per_sample))
+                best_err = disp_deg[best_idx]                          # [T_pred, N_valid], in degrees
 
                 minade_k_list.append(float(best_err.mean()))
                 fde_k_list.append(float(best_err[-1].mean()))
