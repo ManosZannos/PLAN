@@ -1,15 +1,27 @@
 """
-model_cpagrn_nocpa.py — CPA-GRN without TCPA/DCPA (diagnostic ablation).
+model_cpagrn_nocpa.py — CPA-GRN v4 WITHOUT CPA features (ablation)
 
-Identical to model_cpagrn v1 EXCEPT:
-  - Edge features: [dist, sin(bearing), cos(bearing), dhdg, dhdg.abs()]  (5 features)
-  - NO TCPA, NO DCPA
+This is the ablation counterpart to the final v4 architecture
+(model_cpagrn.py). It is IDENTICAL in every respect — per-step temporal
+aggregation, top_k=10 distance-based sparsification, final spatial
+refinement, MLP decoder — EXCEPT that the edge features no longer include
+TCPA/DCPA, only geometric features:
 
-Purpose: determine whether the underperformance of CPA-GRN is due to
-the CPA features specifically, or to the graph attention mechanism in general.
+    edge(i→j) = [dist, sin(bearing), cos(bearing), dhdg, dhdg.abs()]   (5 dims)
 
-If this variant beats LSTM  → problem is in CPA features (fix CPA computation)
-If this variant loses LSTM  → problem is in graph attention (rethink architecture)
+instead of:
+
+    edge(i→j) = [TCPA, DCPA, dist, sin(bearing), cos(bearing), dhdg, dhdg.abs()]  (7 dims)
+
+Purpose: isolate the contribution of TCPA/DCPA specifically. If v4 (with
+CPA) outperforms this no-CPA variant by a similar margin to its advantage
+over LSTM, that demonstrates the improvement is attributable to the CPA
+features themselves — not merely to having *some* spatial attention
+mechanism with per-step temporal integration.
+
+Usage: swap this in for model_cpagrn.py (same train_cpagrn.py / 
+evaluate_cpagrn.py work unchanged, since the public interface — CPAGRN
+class with forward(obs, mask, stats) — is identical).
 """
 
 import torch
@@ -18,18 +30,22 @@ import torch.nn.functional as F
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Edge Features — NO CPA
+# 1. Edge Features — NO CPA (geometry only)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class NoCPAFeatures(nn.Module):
+class CPAFeatures(nn.Module):
     """
-    5 pairwise edge features — geometry only, no collision risk metrics.
+    5 pairwise edge features — geometry only, NO TCPA/DCPA.
 
     For each vessel pair (i → j):
-        dist            — current Euclidean distance
-        sin/cos(bearing)— direction from i to j
-        dhdg            — relative heading difference (z-score space)
-        dhdg.abs()      — absolute heading difference
+        dist             — current Euclidean distance
+        sin/cos(bearing) — direction from i to j
+        dhdg             — relative heading (z-score space)
+        dhdg.abs()       — absolute heading difference
+
+    Named CPAFeatures (not GeometryFeatures) to keep the class interface
+    identical to the full v4 model, so train_cpagrn.py / evaluate_cpagrn.py
+    require zero changes when swapping model files.
     """
 
     EDGE_DIM = 5
@@ -38,22 +54,22 @@ class NoCPAFeatures(nn.Module):
         super().__init__()
         self.eps = eps
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """
-        obs: [B, N, T_obs, 4]
-        Returns: [B, N, N, 5]
-        """
-        B, N, T, _ = obs.shape
-
-        pos = obs[:, :, -1, :2]
-        hdg = obs[:, :, -1, 3]
+    def forward(
+        self,
+        pos: torch.Tensor,   # [B, N, 2]
+        vel: torch.Tensor,   # [B, N, 2]  unused (kept for signature parity)
+        hdg: torch.Tensor,   # [B, N]
+    ) -> torch.Tensor:
+        """Returns [B, N, N, 5]"""
+        B, N, _ = pos.shape
 
         pos_i = pos.unsqueeze(2).expand(B, N, N, 2)
         pos_j = pos.unsqueeze(1).expand(B, N, N, 2)
         hdg_i = hdg.unsqueeze(2).expand(B, N, N)
         hdg_j = hdg.unsqueeze(1).expand(B, N, N)
 
-        r       = pos_j - pos_i
+        r = pos_j - pos_i
+
         dist    = r.norm(dim=-1)
         bearing = torch.atan2(r[..., 1], r[..., 0])
         dhdg    = hdg_j - hdg_i
@@ -68,60 +84,63 @@ class NoCPAFeatures(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Spatial Attention Layer (identical to CPA-GRN v1)
+# 2. Sparse Neighbor Aggregation (identical logic to v4, edge_dim=5)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class SpatialLayer(nn.Module):
+class NeighborAggregation(nn.Module):
 
-    def __init__(self, d_model: int, edge_dim: int = 5, top_k: int = 20):
+    def __init__(self, d_model: int, edge_dim: int = 5, top_k: int = 10):
         super().__init__()
         self.top_k = top_k
+
         self.attn_mlp = nn.Sequential(
-            nn.Linear(2 * d_model + edge_dim, d_model),
+            nn.Linear(d_model + edge_dim, d_model // 2),
             nn.ReLU(),
-            nn.Linear(d_model, 1),
+            nn.Linear(d_model // 2, 1),
         )
-        self.value_proj = nn.Linear(d_model, d_model)
-        self.norm       = nn.LayerNorm(d_model)
+        self.msg_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm     = nn.LayerNorm(d_model)
 
     def forward(self, h, edges, mask):
         B, N, D = h.shape
 
-        h_i = h.unsqueeze(2).expand(B, N, N, D)
-        h_j = h.unsqueeze(1).expand(B, N, N, D)
-
+        h_j    = h.unsqueeze(1).expand(B, N, N, D)
         scores = self.attn_mlp(
-            torch.cat([h_i, h_j, edges], dim=-1)
+            torch.cat([h_j, edges], dim=-1)
         ).squeeze(-1)
 
         if mask is not None:
             mask_j = mask.unsqueeze(1).expand(B, N, N)
             scores = scores.masked_fill(~mask_j, float('-inf'))
 
+        dist = edges[..., 0]  # dist is now index 0 (no TCPA/DCPA prefix)
+        if mask is not None:
+            dist_masked = dist.masked_fill(~mask_j, float('inf'))
+        else:
+            dist_masked = dist
+
         if self.top_k < N:
-            dist = edges[..., 0]  # first feature is dist
-            if mask is not None:
-                dist = dist.masked_fill(~mask_j, float('inf'))
             k = min(self.top_k, N)
-            kth_dist, _ = dist.topk(k, dim=-1, largest=False)
-            threshold   = kth_dist[..., -1].unsqueeze(-1)
-            scores      = scores.masked_fill(dist > threshold, float('-inf'))
+            kth, _ = dist_masked.topk(k, dim=-1, largest=False)
+            threshold = kth[..., -1].unsqueeze(-1)
+            scores = scores.masked_fill(dist_masked > threshold, float('-inf'))
 
         weights = F.softmax(scores, dim=-1)
         weights = torch.nan_to_num(weights, nan=0.0)
 
-        values = self.value_proj(h)
-        agg    = torch.einsum('bij,bjd->bid', weights, values)
+        msgs = self.msg_proj(h)
+        agg  = torch.einsum('bij,bjd->bid', weights, msgs)
 
-        return self.norm(h + agg)
+        return self.norm(self.out_proj(agg))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Main Model
+# 3. Main Model — identical structure to v4, edge_dim=5
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CPAGRN(nn.Module):
-    """Graph Recurrent Network without CPA features (ablation)."""
+    """CPA-GRN v4 architecture WITHOUT CPA features (ablation)."""
 
     def __init__(
         self,
@@ -130,16 +149,21 @@ class CPAGRN(nn.Module):
         gru_layers:   int   = 1,
         pred_len:     int   = 5,
         dropout:      float = 0.0,
-        top_k:        int   = 20,
+        top_k:        int   = 10,
     ):
         super().__init__()
         self.d_model  = d_model
         self.pred_len = pred_len
+        self.top_k    = top_k
 
         self.embed = nn.Sequential(
             nn.Linear(feature_size, d_model),
             nn.LayerNorm(d_model),
         )
+
+        self.cpa_features = CPAFeatures()  # actually geometry-only, see above
+        self.neighbor_agg = NeighborAggregation(d_model, edge_dim=5, top_k=top_k)
+
         self.gru = nn.GRU(
             d_model, d_model,
             num_layers  = gru_layers,
@@ -147,8 +171,7 @@ class CPAGRN(nn.Module):
             dropout     = dropout if gru_layers > 1 else 0.0,
         )
 
-        self.edge_features = NoCPAFeatures()
-        self.spatial       = SpatialLayer(d_model, edge_dim=5, top_k=top_k)
+        self.final_spatial = NeighborAggregation(d_model, edge_dim=5, top_k=top_k)
 
         self.decoder = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -165,19 +188,38 @@ class CPAGRN(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, obs, mask=None):
+    def forward(self, obs, mask=None, stats=None):
         B, N, T, _ = obs.shape
 
-        x    = self.embed(obs)
-        x_in = x.reshape(B * N, T, self.d_model)
-        _, h_n = self.gru(x_in)
-        h    = h_n[-1].reshape(B, N, self.d_model)
+        x = self.embed(obs)
+
+        fused_steps = []
+        for t in range(T):
+            pos_t = obs[:, :, t, :2]
+            hdg_t = obs[:, :, t, 3]
+            vel_t = obs[:, :, t, :2] - obs[:, :, t-1, :2] if t > 0 \
+                    else torch.zeros_like(pos_t)
+
+            edges_t = self.cpa_features(pos_t, vel_t, hdg_t)  # [B,N,N,5]
+            x_t     = x[:, :, t, :]
+            nbr_t   = self.neighbor_agg(x_t, edges_t, mask)
+            fused_steps.append(x_t + nbr_t)
+
+        fused_seq = torch.stack(fused_steps, dim=2)
+
+        gru_in = fused_seq.reshape(B * N, T, self.d_model)
+        _, h_n = self.gru(gru_in)
+        h      = h_n[-1].reshape(B, N, self.d_model)
 
         if mask is not None:
             h = h * mask.float().unsqueeze(-1)
 
-        edges = self.edge_features(obs)
-        h     = self.spatial(h, edges, mask)
+        pos_last   = obs[:, :, -1, :2]
+        vel_last   = obs[:, :, -1, :2] - obs[:, :, -2, :2] if T >= 2 \
+                     else torch.zeros_like(pos_last)
+        hdg_last   = obs[:, :, -1, 3]
+        edges_last = self.cpa_features(pos_last, vel_last, hdg_last)
+        h = h + self.final_spatial(h, edges_last, mask)
 
         out = self.decoder(h).reshape(B, N, self.pred_len, 2)
 
@@ -186,10 +228,6 @@ class CPAGRN(nn.Module):
 
         return out
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Loss (identical)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def cpagrn_loss(pred_disp, target_disp, mask):
     sq_err = (pred_disp - target_disp) ** 2
