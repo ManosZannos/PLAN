@@ -76,6 +76,10 @@ def get_args():
     p.add_argument('--log_every',   type=int,   default=1)
     p.add_argument('--max_train_batches', type=int, default=None,
                    help='Optional cap on optimizer steps per epoch, for quick smoke tests')
+    p.add_argument('--resume', action='store_true',
+                   help='Resume from checkpoints/<tag>/latest.pth and continue training '
+                        'for --epochs additional epochs (model weights only; optimizer '
+                        'state is reinitialized, acceptable for constant-lr Adam).')
     return p.parse_args()
 
 
@@ -269,10 +273,32 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    best_val   = float('inf')
-    best_epoch = 0
+    start_epoch = 0
+    best_val    = float('inf')
+    best_epoch  = 0
 
-    for epoch in range(args.epochs):
+    if args.resume:
+        latest_path = os.path.join(ckpt_dir, 'latest.pth')
+        best_path   = os.path.join(ckpt_dir, 'val_best.pth')
+        if not os.path.exists(latest_path):
+            raise FileNotFoundError(f'--resume given but {latest_path} does not exist')
+
+        latest_ckpt = torch.load(latest_path, map_location=device, weights_only=False)
+        model.load_state_dict(latest_ckpt['model'])
+        start_epoch = latest_ckpt['epoch']
+        log.info(f'Resumed model weights from {latest_path} (epoch {start_epoch})')
+
+        if os.path.exists(best_path):
+            best_ckpt = torch.load(best_path, map_location=device, weights_only=False)
+            best_val   = best_ckpt.get('val_loss', float('inf'))
+            best_epoch = best_ckpt.get('epoch', 0)
+            log.info(f'Loaded best-so-far val_loss={best_val:.6f} (epoch {best_epoch})')
+        log.info(f'Continuing for {args.epochs} additional epochs '
+                  f'(epoch {start_epoch+1} .. {start_epoch+args.epochs})')
+
+    total_epochs = start_epoch + args.epochs
+
+    for epoch in range(start_epoch, total_epochs):
         t0 = time.time()
         train_loss, train_skipped = run_train_epoch(train_loader, model, optimizer, device, args)
         val_loss, val_skipped     = run_val_epoch(val_loader, model, device, args)
@@ -281,9 +307,9 @@ def main():
         metrics['train_loss'].append(train_loss)
         metrics['val_loss'].append(val_loss)
 
-        if (epoch + 1) % args.log_every == 0 or epoch == 0:
+        if (epoch + 1) % args.log_every == 0 or epoch == start_epoch:
             log.info(
-                f'Epoch {epoch+1:>3}/{args.epochs} | '
+                f'Epoch {epoch+1:>3}/{total_epochs} | '
                 f'train={train_loss:.6f} (skip={train_skipped}) | '
                 f'val={val_loss:.6f} (skip={val_skipped}) | t={elapsed:.1f}s'
             )
